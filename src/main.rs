@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYUP, WM_SYSKEYDOWN,
 };
 
-use log::{debug, info, error}; // Import logging macros
+use log::{debug, error, info, warn}; // Import logging macros
 
 // --- Globals for state management ---
 /// Flag to prevent our simulated inputs from recursively re-triggering the hook.
@@ -194,7 +194,7 @@ fn vk_code_from_char(c: char) -> Option<VIRTUAL_KEY> {
 /// Releases all virtual modifiers pressed by the script.
 /// active_vk_mod: The primary activator modifier (e.g., VK_SHIFT for 'f', VK_CONTROL for 'd'/'g') stored in SpaceState.
 /// activating_key_vk: The key ('f'/'d'/'g') that activated the ModifierActive state.
-fn release_virtual_modifiers_optimized(active_vk_mod: VIRTUAL_KEY, activating_key_vk: VIRTUAL_KEY) {
+fn release_virtual_modifiers(active_vk_mod: VIRTUAL_KEY, activating_key_vk: VIRTUAL_KEY) {
     debug!("Releasing virtual modifiers: active_vk_mod: {:?}, activating_key_vk: {:?}", active_vk_mod, activating_key_vk);
 
     send_key_event(active_vk_mod, KeyAction::Release);
@@ -309,7 +309,7 @@ extern "system" fn low_level_keyboard_proc(
                 }
                 SpaceState::ModifierActive { active_vk_mod, activating_key_vk, combo_triggered_in_session } => {
                     info!("Space UP: Exiting ModifierActive state. Releasing virtual modifiers.");
-                    release_virtual_modifiers_optimized(active_vk_mod, activating_key_vk);
+                    release_virtual_modifiers(active_vk_mod, activating_key_vk);
                     if !combo_triggered_in_session {
                         info!("Space UP: No combo triggered in ModifierActive, sending a normal space.");
                         send_transient_combo(&TargetKey { vk_code: VK_SPACE, modifiers: &[] });
@@ -318,7 +318,7 @@ extern "system" fn low_level_keyboard_proc(
                     }
                 }
                 // If Space UP is received in NotPressed or PassthroughActive state, it's unexpected, but ignore it.
-                _ => { debug!("Space UP: Unexpected state, no action needed."); }
+                _ => { warn!("Space UP: Unexpected state, no action needed."); }
             }
             return LRESULT(1); // Consume the Space key's UP event.
         }
@@ -373,9 +373,8 @@ extern "system" fn low_level_keyboard_proc(
                             },
                             _ => {
                                 // No match found for any combination or modifier activation key, treat as invalid combo.
-                                info!("PressedWaiting: Unrecognized key '{}', sending fallback space and passing through original key.", c);
-                                send_transient_combo(&TargetKey { vk_code: VK_SPACE, modifiers: &[] }); // Send fallback space.
-                                *space_state_guard = SpaceState::NotPressed; // Reset for next Space press.
+                                info!("PressedWaiting: Unrecognized key '{}', passing through original key.", c);
+                                *space_state_guard = SpaceState::PressedWaiting { combo_triggered_in_session: true }; // Reset for next combo.
                                 return unsafe { CallNextHookEx(None, n_code, wparam, lparam) }; // Pass through original key.
                             }
                         }
@@ -389,9 +388,8 @@ extern "system" fn low_level_keyboard_proc(
                     }
                 } else {
                     // Non-character key (like Esc, Tab, etc.) pressed, and not in mappings, treat as invalid combo.
-                    info!("PressedWaiting: Non-char key VK_{:X}, sending fallback space and passing through original key.", vk_code.0);
-                    send_transient_combo(&TargetKey { vk_code: VK_SPACE, modifiers: &[] });
-                    *space_state_guard = SpaceState::NotPressed;
+                    info!("PressedWaiting: Non-char key VK_{:X}, passing through original key.", vk_code.0);
+                    *space_state_guard = SpaceState::PressedWaiting { combo_triggered_in_session: true };
                     return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
                 }
             },
@@ -414,17 +412,15 @@ extern "system" fn low_level_keyboard_proc(
                         send_key_event(target_key_action.vk_code, KeyAction::Release);
                         triggered_combo_now = true;
                     } else {
-                        info!("ModifierActive: Unrecognized key '{}' with active mod. Releasing mods, sending fallback space, and passing through original key.", c);
-                        release_virtual_modifiers_optimized(active_vk_mod, activating_key_vk);
-                        send_transient_combo(&TargetKey { vk_code: VK_SPACE, modifiers: &[] });
-                        *space_state_guard = SpaceState::NotPressed;
+                        info!("ModifierActive: Unrecognized key '{}' with active mod. Releasing mods and passing through original key.", c);
+                        release_virtual_modifiers(active_vk_mod, activating_key_vk);
+                        *space_state_guard = SpaceState::PressedWaiting { combo_triggered_in_session: true };
                         return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
                     }
                 } else {
-                    info!("ModifierActive: Non-char key VK_{:X} with active mod. Releasing mods, sending fallback space, and passing through original key.", vk_code.0);
-                    release_virtual_modifiers_optimized(active_vk_mod, activating_key_vk);
-                    send_transient_combo(&TargetKey { vk_code: VK_SPACE, modifiers: &[] });
-                    *space_state_guard = SpaceState::NotPressed;
+                    info!("ModifierActive: Non-char key VK_{:X} with active mod. Passing through original key.", vk_code.0);
+                    release_virtual_modifiers(active_vk_mod, activating_key_vk);
+                    *space_state_guard = SpaceState::PressedWaiting { combo_triggered_in_session: true };
                     return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
                 }
 
@@ -443,7 +439,7 @@ extern "system" fn low_level_keyboard_proc(
         if let SpaceState::ModifierActive { active_vk_mod, activating_key_vk, combo_triggered_in_session } = space_state_after_space_key_check { // Use the latest state.
             if vk_code == activating_key_vk {
                 info!("Activating key '{:?}' UP. Releasing mods and transitioning to PressedWaiting.", vk_code);
-                release_virtual_modifiers_optimized(active_vk_mod, activating_key_vk);
+                release_virtual_modifiers(active_vk_mod, activating_key_vk);
                 // SpaceState rolls back, but combo_triggered_in_session retains its value.
                 *space_state_guard = SpaceState::PressedWaiting { combo_triggered_in_session }; // Update the state in the guard.
                 return LRESULT(1); // Consume this key release.
@@ -474,7 +470,7 @@ fn main() -> windows::core::Result<()> {
     info!("  - Hold Space + g + jl to continuously select text by word (Ctrl + Shift + Cursor Keys).");
     info!("  - Hold Space + h / n / o / . / u / [ / ] for Home / End / PageUp / PageDown / Backspace / Win+Ctrl+Left / Win+Ctrl+Right");
     info!("  - If only the Space key is pressed, it will output a normal space upon release. If any combo (including modifier activation keys) is triggered while Space is held, no extra space will be output upon Space release.");
-    info!("  - If an unmapped key is pressed while Space is held, it will immediately output a fallback space and let the original unmapped key pass through, resetting the Space state.");
+    info!("  - If an unmapped key is pressed while Space is held, it will let the original unmapped key pass through, no extra space will be output upon Space release.");
     info!("");
     info!("Please note: This script will not display a console in Release mode. In Debug mode, the console will show debug information.");
     info!("Close this window to stop the script.");

@@ -64,12 +64,13 @@ If you press `Ctrl` (or `Alt`) while `Space` is already held (and in a waiting s
 ### 💡 Spacebar Release Behavior
 
 *   If you **only** press and release the `Spacebar` (without triggering any combinations or modifier activations), it will output a regular space character.
-*   If you trigger **any** combination (including activating a modifier layer like `Space + f`) during a Space press-release cycle, no additional space will be sent when Space is released.
-*   If you hold `Space` and press an **unmapped key**, the script will immediately output a fallback space, release any active virtual modifiers, and then let the original unmapped key pass through. The Spacebar state will reset.
+*   If you trigger **any** (valid or invalid) combination (including activating a modifier layer like `Space + f` or any unmapped key) during a Space press-release cycle, no additional space will be sent when Space is released.
 
 ## ⚙️ Installation
 
 This project is built with Rust and is designed for **Windows only**.
+
+> The prebuild binary can be found at [Release](https://github.com/zerosignal0101/space_enhancer/releases). Just start the program and it will run in the background.
 
 ### Prerequisites
 

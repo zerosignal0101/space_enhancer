@@ -6,13 +6,14 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{HMODULE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
+    VIRTUAL_KEY, VK_CONTROL, VK_MENU, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
     VK_SHIFT, VK_UP, VK_BACK, VK_ADD, VK_LWIN, VK_SPACE,
     // Add these for better readability
     VK_A, VK_B, VK_C, VK_D, VK_E, VK_F, VK_G, VK_H, VK_I, VK_J, VK_K, VK_L, VK_M,
     VK_N, VK_O, VK_P, VK_Q, VK_R, VK_S, VK_T, VK_U, VK_V, VK_W, VK_X, VK_Y, VK_Z,
     VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7,
     VK_OEM_COMMA, VK_OEM_PERIOD, VK_OEM_MINUS, VK_OEM_PLUS,
+    GetAsyncKeyState
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYUP, WM_SYSKEYDOWN,
@@ -35,6 +36,9 @@ enum SpaceState {
         active_vk_mod: VIRTUAL_KEY, // 激活的实际修饰符，如 VK_LSHIFT 或 VK_CONTROL
         activating_key_vk: VIRTUAL_KEY, // 激活修饰符的原始键码，如 'F'
         combo_triggered_in_session: bool, // 此 Space 按下周期内是否触发过组合
+    },
+    PassthroughActive {
+        activating_modifier: VIRTUAL_KEY, // 激活此模式的修饰键 (VK_CONTROL 或 VK_MENU)
     },
 }
 static SPACE_STATE: Mutex<SpaceState> = Mutex::new(SpaceState::NotPressed);
@@ -208,7 +212,6 @@ extern "system" fn low_level_keyboard_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // 1. 如果 n_code 小于 0，必须直接调用 CallNextHookEx
     if n_code < 0 {
         return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
     }
@@ -230,10 +233,64 @@ extern "system" fn low_level_keyboard_proc(
         return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
     }
 
+    // 获取 Space 状态的可变引用，以便后续修改
+    let mut space_state_guard = SPACE_STATE.lock().unwrap();
+    let current_space_state = *space_state_guard; // 复制当前状态用于匹配
 
-    // --- Space 键按下处理 ---
+    // --- 系统热键（Ctrl+Space / Alt+Space）穿透逻辑 ---
+
+    // 情况 A: 如果当前处于 PassthroughActive 模式，则所有相关按键都直接放行
+    if let SpaceState::PassthroughActive { activating_modifier } = current_space_state {
+        // 如果 Space 键或激活的修饰键被释放，根据情况退出 PassthroughActive 状态
+        if is_key_up && (vk_code == VK_SPACE || vk_code == activating_modifier) {
+            let is_space_still_down = (unsafe { GetAsyncKeyState(VK_SPACE.0 as i32) } as u16 & 0x8000) != 0;
+            let is_mod_still_down = (unsafe { GetAsyncKeyState(activating_modifier.0 as i32) } as u16 & 0x8000) != 0;
+
+            // 只有当 Space 和激活的修饰键都被释放时，才退出 PassthroughActive
+            if !is_space_still_down && !is_mod_still_down {
+                info!("PassthroughActive: All relevant keys released. Exiting PassthroughMode.");
+                *space_state_guard = SpaceState::NotPressed;
+            } else {
+                debug!("PassthroughActive: Key {:?} UP, but other keys still down. Remaining in PassthroughMode.", vk_code);
+            }
+        }
+        debug!("PassthroughActive: Key VK_{:X} ({}) event. Passing through (returning LRESULT(0)).", vk_code.0, debug_vk_char);
+        return unsafe { CallNextHookEx(None, n_code, wparam, lparam) }; // 在PassthroughActive模式下，所有键都通过
+    }
+
+    // 情况 B: 检测 Space 键是否与 Ctrl/Alt 同时按下 (Space DOWN, Ctrl/Alt ALREADY DOWN)
+    if vk_code == VK_SPACE && is_key_down {
+        let is_ctrl_currently_down = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
+        let is_alt_currently_down = (unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } as u16 & 0x8000) != 0;
+
+        if is_ctrl_currently_down || is_alt_currently_down {
+            info!("Space DOWN detected with system modifier (Ctrl/Alt) already held. Bypassing custom Space logic to allow native system hotkey.");
+            let activating_modifier = if is_ctrl_currently_down { VK_CONTROL } else { VK_MENU };
+            *space_state_guard = SpaceState::PassthroughActive { activating_modifier };
+            // 这里直接返回 LRESULT(0)，让 Space 事件通过，不被消耗
+            return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
+        }
+    }
+
+    // 情况 C: 检测 Ctrl/Alt 键是否在 Space 已经激活 (PressedWaiting) 时按下 (Space HELD, Ctrl/Alt DOWN)
+    if (vk_code == VK_CONTROL || vk_code == VK_MENU) && is_key_down {
+        if let SpaceState::PressedWaiting { .. } = current_space_state {
+            info!("System modifier (Ctrl/Alt) DOWN detected while Space is held (by our script). Un-consuming Space and enabling passthrough for native system hotkey.");
+            // 此时 Space 已经被我们消耗了，系统没有收到它的 DOWN 事件。
+            // 我们需要发送一个虚拟的 Space DOWN 事件，让系统认为 Space 已经按下了。
+            send_key_event(VK_SPACE, KeyAction::Press); // 修复系统对 Space 键的 DOWN 状态认知
+            *space_state_guard = SpaceState::PassthroughActive { activating_modifier: vk_code };
+            // 然后让这个 Ctrl/Alt 键的 DOWN 事件也通过
+            return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
+        }
+    }
+
+    // --- END of 系统热键穿透逻辑 ---
+
+    // 如果以上系统热键逻辑没有触发，则继续处理 Space 本身或其他组合键
+
+    // --- Space 键按下/抬起处理 ---
     if vk_code == VK_SPACE {
-        let mut space_state_guard = SPACE_STATE.lock().unwrap();
         if is_key_down {
             match *space_state_guard {
                 SpaceState::NotPressed => {
@@ -241,9 +298,9 @@ extern "system" fn low_level_keyboard_proc(
                     *space_state_guard = SpaceState::PressedWaiting { combo_triggered_in_session: false };
                     return LRESULT(1); // 消耗 Space 键的按下事件
                 }
-                _ => {
-                    debug!("Space DOWN: Already in Space state, consume.");
-                    return LRESULT(1) // 如果 Space 已经处于 PressedWaiting 或 ModifierActive 状态，再次按下 Space 键时也消耗
+                _ => { // should not happen if logic is correct, but consume if it does
+                    debug!("Space DOWN: Already in Space state, consume and return.");
+                    return LRESULT(1);
                 }
             }
         } else if is_key_up {
@@ -259,7 +316,7 @@ extern "system" fn low_level_keyboard_proc(
                     }
                 }
                 SpaceState::ModifierActive { active_vk_mod, activating_key_vk, combo_triggered_in_session } => {
-                    info!("Space UP: Exiting ModifierActive state.");
+                    info!("Space UP: Exiting ModifierActive state. Releasing virtual modifiers.");
                     release_virtual_modifiers_optimized(active_vk_mod, activating_key_vk);
                     if !combo_triggered_in_session {
                         info!("Space UP: No combo triggered in ModifierActive, sending a normal space.");
@@ -268,18 +325,18 @@ extern "system" fn low_level_keyboard_proc(
                         info!("Space UP: Combo triggered in ModifierActive, no extra space.");
                     }
                 }
-                _ => { debug!("Space UP: Non-Space state, no action needed."); } // NotPressed, no action needed
+                // 如果在 NotPressed 或 PassthroughActive 状态下收到 Space UP，理论上不应该，但如果发生了就忽略
+                _ => { debug!("Space UP: Unexpected state, no action needed."); }
             }
             return LRESULT(1); // 消耗 Space 键的释放事件
         }
     }
 
     // --- 其他键处理（在 Space 键处于活跃状态时）---
-    let mut space_state_guard = SPACE_STATE.lock().unwrap(); // 获取可变引用以便修改 combo_triggered_in_session
-    let current_space_state = *space_state_guard; // 复制当前状态进行匹配
+    let space_state_after_space_key_check = *space_state_guard; // 重新读取最新状态
 
     if is_key_down {
-        match current_space_state {
+        match space_state_after_space_key_check {
             SpaceState::PressedWaiting { combo_triggered_in_session: mut current_session_triggered_flag } => {
                 debug!("Key DOWN in PressedWaiting state: VK_{:X}", vk_code.0);
                 if let Some(c) = vk_code_to_char(vk_code) {
@@ -299,25 +356,28 @@ extern "system" fn low_level_keyboard_proc(
                     }
                     // 3. 尝试匹配修饰符激活键
                     else {
-                        match vk_code { // Match directly on vk_code for activating keys
+                        match vk_code {
                             VK_F => {
                                 info!("PressedWaiting: Activated Shift modifier with 'F'.");
                                 send_key_event(VK_SHIFT, KeyAction::Press);
+                                // 更新 guard 中的状态
                                 *space_state_guard = SpaceState::ModifierActive { active_vk_mod: VK_SHIFT, activating_key_vk: VK_F, combo_triggered_in_session: true };
-                                return LRESULT(1); // 消耗此键，因为状态已改变，且已处理
+                                return LRESULT(1);
                             },
                             VK_D => {
                                 info!("PressedWaiting: Activated Ctrl modifier with 'D'.");
                                 send_key_event(VK_CONTROL, KeyAction::Press);
+                                // 更新 guard 中的状态
                                 *space_state_guard = SpaceState::ModifierActive { active_vk_mod: VK_CONTROL, activating_key_vk: VK_D, combo_triggered_in_session: true };
-                                return LRESULT(1); // 消耗此键
+                                return LRESULT(1);
                             },
                             VK_G => {
                                 info!("PressedWaiting: Activated Ctrl+Shift modifier with 'G'.");
                                 send_key_event(VK_CONTROL, KeyAction::Press);
                                 send_key_event(VK_SHIFT, KeyAction::Press);
+                                // 更新 guard 中的状态
                                 *space_state_guard = SpaceState::ModifierActive { active_vk_mod: VK_CONTROL, activating_key_vk: VK_G, combo_triggered_in_session: true };
-                                return LRESULT(1); // 消耗此键
+                                return LRESULT(1);
                             },
                             _ => {
                                 // 未匹配到任何组合或修饰符激活键，视为无效组合
@@ -331,6 +391,7 @@ extern "system" fn low_level_keyboard_proc(
 
                     if triggered_combo_now {
                         // 如果触发了任何组合，更新 combo_triggered_in_session 标志
+                        // 直接修改 guard 中的状态
                         *space_state_guard = SpaceState::PressedWaiting { combo_triggered_in_session: true };
                         return LRESULT(1); // 消耗此键
                     }
@@ -357,12 +418,10 @@ extern "system" fn low_level_keyboard_proc(
 
                     if let Some(target_key_action) = map_to_check.get(&c) {
                         info!("ModifierActive: Matched combo '{:?}' with active mod. Sending target key.", c);
-                        // 只需发送目标键的按下和释放事件，修饰符已经由系统按住
                         send_key_event(target_key_action.vk_code, KeyAction::Press);
                         send_key_event(target_key_action.vk_code, KeyAction::Release);
                         triggered_combo_now = true;
                     } else {
-                        // 修饰符活跃状态下，按下了未映射的键，视为无效组合
                         info!("ModifierActive: Unrecognized key '{:?}' with active mod. Releasing mods and passing original key after fallback space.", c);
                         release_virtual_modifiers_optimized(active_vk_mod, activating_key_vk);
                         send_transient_combo(&TargetKey { vk_code: VK_SPACE, modifiers: &[] });
@@ -370,7 +429,6 @@ extern "system" fn low_level_keyboard_proc(
                         return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
                     }
                 } else {
-                    // 非字符键被按下，且未在映射中，视为无效组合
                     info!("ModifierActive: Non-char key VK_{:X} with active mod. Releasing mods and passing original key after fallback space.", vk_code.0);
                     release_virtual_modifiers_optimized(active_vk_mod, activating_key_vk);
                     send_transient_combo(&TargetKey { vk_code: VK_SPACE, modifiers: &[] });
@@ -379,24 +437,23 @@ extern "system" fn low_level_keyboard_proc(
                 }
 
                 if triggered_combo_now {
-                    // 如果触发了任何组合，更新 combo_triggered_in_session 标志
+                    // 更新 guard 中的状态
                     *space_state_guard = SpaceState::ModifierActive { active_vk_mod, activating_key_vk, combo_triggered_in_session: true };
                 }
                 return LRESULT(1); // 消耗此键
             },
-            SpaceState::NotPressed => {
-                // Space 键未按下，不处理此事件
+            _ => { // NotPressed, PassthroughActive - 不做处理
+                // debug!("Key DOWN (VK_{:X}) in inactive or passthrough state. Passing through.", vk_code.0);
             }
         }
     } else if is_key_up {
         // 如果是修饰符激活键（'f', 'd', 'g'）的释放，并且 Space 仍处于 ModifierActive 状态
-        if let SpaceState::ModifierActive { active_vk_mod, activating_key_vk, combo_triggered_in_session } = current_space_state {
+        if let SpaceState::ModifierActive { active_vk_mod, activating_key_vk, combo_triggered_in_session } = space_state_after_space_key_check { // 使用最新的状态
             if vk_code == activating_key_vk {
                 info!("Activating key '{:?}' UP. Releasing mods and transitioning to PressedWaiting.", vk_code);
-                // 用户释放了激活键，但 Space 仍按下。转换回 PressedWaiting 状态。
                 release_virtual_modifiers_optimized(active_vk_mod, activating_key_vk);
                 // 此时 SpaceState 回退，但 combo_triggered_in_session 保持原值
-                *space_state_guard = SpaceState::PressedWaiting { combo_triggered_in_session };
+                *space_state_guard = SpaceState::PressedWaiting { combo_triggered_in_session }; // 更新 guard 中的状态
                 return LRESULT(1); // 消耗此键的释放
             }
         }

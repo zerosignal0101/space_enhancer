@@ -7,6 +7,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
     VIRTUAL_KEY, VK_CONTROL, VK_MENU, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
     VK_SHIFT, VK_UP, VK_BACK, VK_ADD, VK_LWIN, VK_SPACE,
+    VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_RWIN,
     // Add these for better readability
     VK_A, VK_B, VK_C, VK_D, VK_E, VK_F, VK_G, VK_H, VK_I, VK_J, VK_K, VK_L, VK_M,
     VK_N, VK_O, VK_P, VK_Q, VK_R, VK_S, VK_T, VK_U, VK_V, VK_W, VK_X, VK_Y, VK_Z,
@@ -236,21 +237,13 @@ extern "system" fn low_level_keyboard_proc(
     let current_space_state = *space_state_guard; // Copy current state for matching.
 
     // --- System Hotkey (Ctrl+Space / Alt+Space / Win+Space) Passthrough Logic ---
-
+    
     // Case A: If currently in PassthroughActive mode, all relevant key events are passed through.
     if let SpaceState::PassthroughActive { activating_modifier } = current_space_state {
-        // If Space or the activating modifier is released, exit PassthroughActive state under certain conditions.
+        // If Space or the activating modifier is released, exit PassthroughActive state.
         if is_key_up && (vk_code == VK_SPACE || vk_code == activating_modifier) {
-            let is_space_still_down = (unsafe { GetAsyncKeyState(VK_SPACE.0 as i32) } as u16 & 0x8000) != 0;
-            let is_mod_still_down = (unsafe { GetAsyncKeyState(activating_modifier.0 as i32) } as u16 & 0x8000) != 0;
-
-            // Only exit PassthroughActive when both Space and the activating modifier are released.
-            if !is_space_still_down && !is_mod_still_down {
-                info!("PassthroughActive: All relevant keys released. Exiting PassthroughMode.");
-                *space_state_guard = SpaceState::NotPressed;
-            } else {
-                debug!("PassthroughActive: Key {:?} UP, but other keys still down. Remaining in PassthroughMode.", vk_code);
-            }
+            info!("PassthroughActive: Key {:?} UP received. Exiting PassthroughMode.", vk_code);
+            *space_state_guard = SpaceState::NotPressed;
         }
         debug!("PassthroughActive: Key VK_{:X} ({}) event. Passing through (returning LRESULT(0)).", vk_code.0, debug_vk_char);
         return unsafe { CallNextHookEx(None, n_code, wparam, lparam) }; // In PassthroughActive mode, all keys pass through.
